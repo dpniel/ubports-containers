@@ -1,0 +1,194 @@
+#!/bin/bash
+
+set -e
+
+echo $UT_CONTAINER_NAME
+
+# What release would you like the container to target
+# options are vivid or xenial
+UT_TARGET=${UT_TARGET:=vivid}
+
+# What would you like to call the container. This is the id you will
+# use to access the container
+UT_CONTAINER_NAME=${UT_CONTAINER_NAME:=$UT_TARGET-cross}
+
+# Which host directory would you like to mount as the
+# home directory in the container. Default is ${HOME}
+UT_CONTAINER_HOME=${UT_CONTAINER_HOME:=${HOME}}
+
+# Set to 0 to disable use of overlay ppa
+USE_OVERLAY_PPA=${USE_OVERLAY_PPA:=0}
+
+# Set to 0 to disable ubports repo
+USE_UBPORTS_REPO=${USE_UBPORTS_REPO:=0}
+
+INSTALL_LIBS=1
+
+function info_msg() {
+    echo -e "\033[1;32m[ ${UT_CONTAINER_NAME} ] $1\033[0m"
+}
+
+function error_msg() {
+    echo -e "\033[0;31m[ ${UT_CONTAINER_NAME} ] $1\033[0m"
+}
+
+function print_config() {
+    echo "---- Container Configuration ----"
+    echo "Target: ${UT_TARGET}"
+    echo "Name: ${UT_CONTAINER_NAME}"
+    echo "Mount: ${UT_CONTAINER_HOME}"
+    echo "Use overlay: ${USE_OVERLAY_PPA}"
+    echo "Use ubports: ${USE_UBPORTS_REPO}"
+    echo "---------------------------------"
+}
+
+function check_lxd_init() {
+   lxc profile device show default | grep nic > /dev/null
+
+   if [ $? -ne 0 ]; then
+      error_msg "You need to run 'sudo lxd init' and reboot before continuing"
+      exit 1;
+   else
+      info_msg "default lxd profile already configured";
+   fi
+}
+
+function check_uid_gid() {
+    uidvalue="root:$(id -u):1"
+    gidvalue="root:$(id -g):1"
+
+    if grep -Fxq "$uidvalue" /etc/subuid
+    then
+        info_msg "UID/GID already set"
+    else
+        echo "$uidvalue" | sudo tee -a /etc/subuid
+        echo "$gidvalue" | sudo tee -a /etc/subgid
+    fi
+}
+
+function create_container() {
+    target="16.04"
+    if [ "$UT_TARGET" == "vivid" ]; then
+        target="15.04"
+    fi
+    image="ubuntu:${target}"
+
+    info_msg "Creating $UT_CONTAINER_NAME container from ${image}"
+    lxc init ${image} $UT_CONTAINER_NAME
+
+    info_msg "Configuring container permissions"
+    lxc config set $UT_CONTAINER_NAME raw.idmap "both $(id -u) $(id -g)"
+
+    info_msg "Adding $UT_CONTAINER_HOME as a disk device"
+    lxc config device add $UT_CONTAINER_NAME homedir disk source=$UT_CONTAINER_HOME path=/home/ubuntu
+    info_msg "Container configured and ready to go"
+}
+
+function run_exec() {
+    lxc exec $UT_CONTAINER_NAME -- sh -c "$1"
+}
+
+function run_exec_user() {
+    lxc exec $UT_CONTAINER_NAME -- sudo --login --user ubuntu sh -c "$1"
+}
+
+function configure_cross_build() {
+    info_msg "Updating container sources";
+    cat $PWD/data/$UT_TARGET-sources.list | lxc exec $UT_CONTAINER_NAME -- sh -c "cat > /etc/apt/sources.list"
+    info_msg "Sources.list changed to:"
+    run_exec "cat /etc/apt/sources.list"
+    echo ""
+    info_msg "Adding armhf arhitecture"
+    run_exec "dpkg --add-architecture armhf && apt-get update"
+}
+
+function add_overlay_ppa() {
+    info_msg "Adding overlay ppa"
+    run_exec "add-apt-repository -y ppa:ci-train-ppa-service/stable-phone-overlay && apt-get update"
+}
+
+function add_ubports_repo() {
+    info_msg "Adding ubports repo"
+    run_exec "echo \"deb http://repo.ubports.com ${UT_TARGET} main\" >> /etc/apt/sources.list && wget -qO - http://repo.ubports.com/keyring.gpg | apt-key add -"
+    info_msg "Pinning ubports repo"
+    run_exec "echo \"Package: *\" > /etc/apt/preferences.d/ubports.pref && \
+        echo \"Pin: origin repo.ubports.com\" >> /etc/apt/preferences.d/ubports.pref && \
+        echo \"Pin-Priority: 2000\" >> /etc/apt/preferences.d/ubports.pref"
+    run_exec "apt update"
+}
+
+function install_sdk_libs() {
+    cat $PWD/data/$UT_TARGET.txt | lxc exec $UT_CONTAINER_NAME -- xargs apt install -y
+}
+
+function cmd() { echo `basename $0`; }
+
+function usage() {
+    echo "\
+    `cmd` [OPTIONS...]
+    -t, --target; What platform to target. xenial or vivid (default: ${UT_TARGET})
+    -n, --name; Name of the container. If no name is given then one of TARGET-cross will be used
+    -m, --mount; Directory to mount as containers home directory (default: ${UT_CONTAINER_HOME})
+    -o, --use-overlay; use the stable overlay ppa
+    -u, --use-ubports; use the ubports repo
+    " | column -t -s ";"
+}
+
+while [ "$1" != "" ]; do
+    case $1 in
+        -t | --target )
+            shift;
+            UT_TARGET=$1;
+            UT_CONTAINER_NAME=${UT_TARGET}-cross;
+            ;;
+        -n | --name )
+            shift;
+            UT_CONTAINER_NAME=$1;
+            ;;
+        -m | --mount )
+            shift;
+            UT_CONTAINER_HOME=$1;
+            ;;
+        -o | --use-overlay )
+            USE_OVERLAY_PPA=1
+            ;;
+        -u | --use-ubports )
+            USE_UBPORTS_REPO=1
+            ;;
+        -N | --no-libs )
+            INSTALL_LIBS=0
+            ;;
+        -h | --help )
+            usage
+            exit;
+            ;;
+        * )
+            usage
+            exit 1
+    esac
+    shift
+done
+
+check_lxd_init
+check_uid_gid
+print_config
+create_container
+
+lxc start $UT_CONTAINER_NAME
+info_msg "Waiting for container to initialize"
+sleep 10
+configure_cross_build
+
+if [ "$USE_OVERLAY_PPA" -ne 0 ]; then
+    add_overlay_ppa;
+fi
+
+if [ "$USE_UBPORTS_REPO" -ne 0 ]; then
+    add_ubports_repo;
+fi
+
+if [ "$INSTALL_LIBS" -ne 0 ]; then
+    install_sdk_libs
+fi
+
+info_msg "All done..."
